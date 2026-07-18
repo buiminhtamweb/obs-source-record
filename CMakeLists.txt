@@ -19,7 +19,13 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/version.h.in ${CMAKE_CURRENT_SOURCE_D
 
 target_sources(${PROJECT_NAME} PRIVATE
 	source-record.c
-	source-record.h)
+	source-record.h
+	websocket_requests.cpp
+	websocket_requests.hpp)
+
+set_target_properties(${PROJECT_NAME} PROPERTIES
+	CXX_STANDARD 17
+	CXX_STANDARD_REQUIRED ON)
 
 
 if(BUILD_OUT_OF_TREE)
@@ -45,7 +51,7 @@ if(OS_WINDOWS)
 	target_sources(${PROJECT_NAME} PRIVATE 
 		${CMAKE_CURRENT_SOURCE_DIR}/${PROJECT_NAME}.rc)
 	target_link_libraries(${PROJECT_NAME}
-		w32-pthreads)
+		OBS::w32-pthreads)
 elseif(OS_MACOS)
 		set(MACOS_BUNDLEID "com.exeldro.${PROJECT_NAME}")
 		set(MACOSX_PLUGIN_GUI_IDENTIFIER "${MACOS_BUNDLEID}")

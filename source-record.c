@@ -6,6 +6,7 @@
 #include <util/dstr.h>
 #include "version.h"
 #include "obs-websocket-api.h"
+#include "websocket_requests.hpp"
 
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -21,42 +22,7 @@
 #define BACKGROUND_CHANNEL 0
 #define SOURCE_CHANNEL 1
 
-struct source_record_filter_context {
-	obs_source_t *source;
-	video_t *video_output;
-	audio_t *audio_output;
-	bool output_active;
-	uint32_t width;
-	uint32_t height;
-	uint64_t last_frame_time_ns;
-	obs_view_t *view;
-	bool starting_file_output;
-	bool starting_stream_output;
-	bool starting_replay_output;
-	bool restart;
-	obs_output_t *fileOutput;
-	obs_output_t *streamOutput;
-	obs_output_t *replayOutput;
-	obs_encoder_t *encoder;
-	obs_encoder_t *audioEncoder[MAX_AUDIO_MIXES];
-	obs_service_t *service;
-	bool record;
-	bool stream;
-	bool replayBuffer;
-	obs_hotkey_pair_id enableHotkey;
-	obs_hotkey_pair_id pauseHotkeys;
-	obs_hotkey_id splitHotkey;
-	obs_hotkey_id chapterHotkey;
-	int audio_track;
-	obs_weak_source_t *audio_source;
-	bool closing;
-	bool exiting;
-	long long replay_buffer_duration;
-	struct vec4 backgroundColor;
-	bool remove_after_record;
-	long long record_max_seconds;
-	int last_frontend_event;
-};
+#include "source-record.h"
 
 DARRAY(obs_source_t *) source_record_filters;
 
@@ -276,6 +242,11 @@ static void start_file_output_task(void *data)
 			context->output_active = true;
 			obs_source_inc_showing(obs_filter_get_parent(context->source));
 		}
+		obs_data_t *settings = obs_output_get_settings(context->fileOutput);
+		const char *path = obs_data_get_string(settings, "path");
+		blog(LOG_INFO, "Recording started\nOutput:\n%s", path);
+		obs_data_release(settings);
+		websocket_context_clear_next_filename(context->websocket_context);
 	}
 	context->starting_file_output = false;
 }
@@ -312,6 +283,7 @@ static void release_encoders(void *param)
 struct stop_output {
 	struct source_record_filter_context *context;
 	obs_output_t *output;
+	bool is_recording;
 };
 
 static void source_record_replay_saved(void *data, calldata_t *cd)
@@ -361,6 +333,9 @@ void release_output_stopped(void *data, calldata_t *cd)
 {
 	UNUSED_PARAMETER(cd);
 	struct stop_output *so = data;
+	if (so->is_recording) {
+		blog(LOG_INFO, "Recording stopped");
+	}
 	if (!so->context->exiting)
 		run_queued((obs_task_t)obs_output_release, so->output);
 	if (so->context->encoder || so->context->audioEncoder[0]) {
@@ -441,8 +416,12 @@ static void stop_output_sync(struct source_record_filter_context *context, obs_o
 	signal_handler_t *sh = obs_output_get_signal_handler(output);
 	if (sh)
 		signal_handler_disconnect(sh, "stop", remove_filter, context);
-	if (obs_output_active(output))
+	if (obs_output_active(output)) {
+		if (output == context->fileOutput) {
+			blog(LOG_INFO, "Recording stopped");
+		}
 		obs_output_force_stop(output);
+	}
 }
 
 static const char *get_encoder_id(obs_data_t *settings)
@@ -520,14 +499,14 @@ static void update_video_encoder(struct source_record_filter_context *filter, ob
 static void start_file_output(struct source_record_filter_context *filter, obs_data_t *settings)
 {
 	obs_data_t *s = obs_data_create();
-	char path[512];
 	const char *format = obs_data_get_string(settings, "rec_format");
-	char *filename =
-		os_generate_formatted_filename(GetFormatExt(format), true, obs_data_get_string(settings, "filename_formatting"));
-	snprintf(path, 512, "%s/%s", obs_data_get_string(settings, "path"), filename);
-	bfree(filename);
+	const char *ext = GetFormatExt(format);
+	const char *record_folder = obs_data_get_string(settings, "path");
+	const char *filename_formatting = obs_data_get_string(settings, "filename_formatting");
+	char *path = websocket_context_generate_path(filter->websocket_context, record_folder, ext, filename_formatting);
 	ensure_directory(path);
 	obs_data_set_string(s, "path", path);
+	bfree(path);
 	obs_data_set_string(s, "directory", obs_data_get_string(settings, "path"));
 	obs_data_set_string(s, "format", obs_data_get_string(settings, "filename_formatting"));
 	obs_data_set_string(s, "extension", GetFormatExt(format));
@@ -958,6 +937,7 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 				struct stop_output *so = bmalloc(sizeof(struct stop_output));
 				so->output = filter->fileOutput;
 				so->context = filter;
+				so->is_recording = true;
 				run_queued(force_stop_output_task, so);
 				filter->fileOutput = NULL;
 			}
@@ -989,6 +969,7 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 				struct stop_output *so = bmalloc(sizeof(struct stop_output));
 				so->output = filter->replayOutput;
 				so->context = filter;
+				so->is_recording = false;
 				run_queued(force_stop_output_task, so);
 				filter->replayOutput = NULL;
 			}
@@ -1003,6 +984,7 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 			struct stop_output *so = bmalloc(sizeof(struct stop_output));
 			so->output = filter->replayOutput;
 			so->context = filter;
+			so->is_recording = false;
 			run_queued(force_stop_output_task, so);
 			filter->replayOutput = NULL;
 			start_replay_output(filter, settings);
@@ -1049,6 +1031,7 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 				struct stop_output *so = bmalloc(sizeof(struct stop_output));
 				so->output = filter->streamOutput;
 				so->context = filter;
+				so->is_recording = false;
 				run_queued(force_stop_output_task, so);
 				filter->streamOutput = NULL;
 			}
@@ -1194,6 +1177,7 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 {
 	struct source_record_filter_context *context = bzalloc(sizeof(struct source_record_filter_context));
 	context->source = source;
+	context->websocket_context = websocket_context_create();
 
 	da_push_back(source_record_filters, &source);
 	context->last_frontend_event = -1;
@@ -1271,6 +1255,7 @@ static void source_record_filter_destroy(void *data)
 	}
 
 	context->source = NULL;
+	websocket_context_destroy(context->websocket_context);
 	bfree(context);
 }
 
@@ -1459,6 +1444,7 @@ static void source_record_filter_tick(void *data, float seconds)
 			struct stop_output *so = bmalloc(sizeof(struct stop_output));
 			so->output = context->fileOutput;
 			so->context = context;
+			so->is_recording = true;
 			run_queued(force_stop_output_task, so);
 			context->fileOutput = NULL;
 		}
@@ -1466,6 +1452,7 @@ static void source_record_filter_tick(void *data, float seconds)
 			struct stop_output *so = bmalloc(sizeof(struct stop_output));
 			so->output = context->streamOutput;
 			so->context = context;
+			so->is_recording = false;
 			run_queued(force_stop_output_task, so);
 			context->streamOutput = NULL;
 		}
@@ -1473,6 +1460,7 @@ static void source_record_filter_tick(void *data, float seconds)
 			struct stop_output *so = bmalloc(sizeof(struct stop_output));
 			so->output = context->replayOutput;
 			so->context = context;
+			so->is_recording = false;
 			run_queued(force_stop_output_task, so);
 			context->replayOutput = NULL;
 		}
@@ -1526,6 +1514,7 @@ static void source_record_filter_tick(void *data, float seconds)
 			struct stop_output *so = bmalloc(sizeof(struct stop_output));
 			so->output = context->fileOutput;
 			so->context = context;
+			so->is_recording = true;
 			run_queued(force_stop_output_task, so);
 			context->fileOutput = NULL;
 		}
@@ -1533,6 +1522,7 @@ static void source_record_filter_tick(void *data, float seconds)
 			struct stop_output *so = bmalloc(sizeof(struct stop_output));
 			so->output = context->streamOutput;
 			so->context = context;
+			so->is_recording = false;
 			run_queued(force_stop_output_task, so);
 			context->streamOutput = NULL;
 		}
@@ -1540,6 +1530,7 @@ static void source_record_filter_tick(void *data, float seconds)
 			struct stop_output *so = bmalloc(sizeof(struct stop_output));
 			so->output = context->replayOutput;
 			so->context = context;
+			so->is_recording = false;
 			run_queued(force_stop_output_task, so);
 			context->replayOutput = NULL;
 		}
@@ -1699,8 +1690,8 @@ static obs_properties_t *source_record_filter_properties(void *data)
 	p = obs_properties_add_int(split_file, "max_size_mb",
 				   obs_frontend_get_locale_string("Basic.Settings.Output.SplitFile.Size"), 0, 1073741824, 1);
 	obs_property_int_set_suffix(p, " MB");
-	obs_properties_add_button(split_file, "split_file_now", obs_frontend_get_locale_string("Basic.Main.SplitFile"),
-				 source_record_split_button);
+	obs_properties_add_button2(split_file, "split_file_now", obs_frontend_get_locale_string("Basic.Main.SplitFile"),
+				  source_record_split_button, data);
 	obs_properties_add_group(record, "split_file", obs_frontend_get_locale_string("Basic.Settings.Output.EnableSplitFile"),
 				 OBS_GROUP_CHECKABLE, split_file);
 
@@ -2597,6 +2588,22 @@ static void websocket_stop_stream(obs_data_t *request_data, obs_data_t *response
 	obs_data_set_bool(response_data, "success", success);
 }
 
+struct source_record_filter_context *find_filter_context(const char *source_name)
+{
+	if (!source_name || !strlen(source_name))
+		return NULL;
+	obs_source_t *source = obs_get_source_by_name(source_name);
+	if (!source)
+		return NULL;
+	obs_source_t *filter = NULL;
+	obs_source_enum_filters(source, find_filter, &filter);
+	obs_source_release(source);
+	if (!filter)
+		return NULL;
+	struct source_record_filter_context *context = obs_obj_get_data(filter);
+	return context;
+}
+
 bool obs_module_load(void)
 {
 	blog(LOG_INFO, "[Source Record] loaded version %s", PROJECT_VERSION);
@@ -2616,6 +2623,8 @@ bool obs_module_load(void)
 	obs_websocket_vendor_register_request(vendor, "replay_buffer_save", websocket_save_replay_buffer, NULL);
 	obs_websocket_vendor_register_request(vendor, "stream_start", websocket_start_stream, NULL);
 	obs_websocket_vendor_register_request(vendor, "stream_stop", websocket_stop_stream, NULL);
+
+	register_custom_websocket_requests(vendor);
 
 	return true;
 }
