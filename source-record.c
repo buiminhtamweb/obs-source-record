@@ -18,6 +18,7 @@
 #define OUTPUT_MODE_RECORDING 3
 #define OUTPUT_MODE_STREAMING_OR_RECORDING 4
 #define OUTPUT_MODE_VIRTUAL_CAMERA 5
+#define OUTPUT_MODE_WEBSOCKET 6
 
 #define BACKGROUND_CHANNEL 0
 #define SOURCE_CHANNEL 1
@@ -503,7 +504,9 @@ static void start_file_output(struct source_record_filter_context *filter, obs_d
 	const char *ext = GetFormatExt(format);
 	const char *record_folder = obs_data_get_string(settings, "path");
 	const char *filename_formatting = obs_data_get_string(settings, "filename_formatting");
-	char *path = websocket_context_generate_path(filter->websocket_context, record_folder, ext, filename_formatting);
+	const long long record_mode = obs_data_get_int(settings, "record_mode");
+	bool is_websocket_mode = (record_mode == OUTPUT_MODE_WEBSOCKET);
+	char *path = websocket_context_generate_path(filter->websocket_context, record_folder, ext, filename_formatting, is_websocket_mode);
 	ensure_directory(path);
 	obs_data_set_string(s, "path", path);
 	bfree(path);
@@ -853,6 +856,7 @@ static void update_encoder(struct source_record_filter_context *filter, obs_data
 static void source_record_filter_update(void *data, obs_data_t *settings)
 {
 	struct source_record_filter_context *filter = data;
+	bool state_changed = false;
 	obs_source_t *parent = obs_filter_get_parent(filter->source);
 	if (obs_obj_is_private(parent)) {
 		filter->closing = true;
@@ -898,6 +902,8 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 			  filter->last_frontend_event != OBS_FRONTEND_EVENT_RECORDING_STOPPED);
 	} else if (record_mode == OUTPUT_MODE_VIRTUAL_CAMERA) {
 		record = obs_frontend_virtualcam_active() && filter->last_frontend_event != OBS_FRONTEND_EVENT_VIRTUALCAM_STOPPED;
+	} else if (record_mode == OUTPUT_MODE_WEBSOCKET) {
+		record = filter->websocket_recording;
 	}
 
 	if (parent && filter->view && (record || replay_buffer)) {
@@ -943,6 +949,7 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 			}
 		}
 		filter->record = record;
+		state_changed = true;
 	}
 
 	if (record && filter->fileOutput && filter->last_frontend_event == OBS_FRONTEND_EVENT_RECORDING_PAUSED &&
@@ -976,6 +983,7 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 		}
 
 		filter->replayBuffer = replay_buffer;
+		state_changed = true;
 	} else if (replay_buffer && filter->replayOutput && obs_source_enabled(filter->source)) {
 		if (filter->replay_buffer_duration != obs_data_get_int(settings, "replay_duration")) {
 			obs_data_t *hotkeys = obs_hotkeys_save_output(filter->replayOutput);
@@ -1037,6 +1045,7 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 			}
 		}
 		filter->stream = stream;
+		state_changed = true;
 	}
 
 	if (!replay_buffer && !record && !stream) {
@@ -1081,6 +1090,20 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 	} else if (filter->audio_source) {
 		obs_weak_source_release(filter->audio_source);
 		filter->audio_source = NULL;
+	}
+
+	if (state_changed) {
+		obs_data_t *event_data = obs_data_create();
+		obs_source_t *parent = obs_filter_get_parent(filter->source);
+		obs_data_set_string(event_data, "source", parent ? obs_source_get_name(parent) : "");
+		obs_data_set_string(event_data, "filter", obs_source_get_name(filter->source));
+		obs_data_set_bool(event_data, "recording", filter->record);
+		obs_data_set_bool(event_data, "streaming", filter->stream);
+		obs_data_set_bool(event_data, "replay_buffer", filter->replayBuffer);
+		bool is_paused = filter->record && filter->fileOutput && obs_output_paused(filter->fileOutput);
+		obs_data_set_bool(event_data, "paused", is_paused);
+		obs_websocket_vendor_emit_event(vendor, "StateChanged", event_data);
+		obs_data_release(event_data);
 	}
 }
 
@@ -1665,6 +1688,7 @@ static obs_properties_t *source_record_filter_properties(void *data)
 	obs_property_list_add_int(p, obs_module_text("Recording"), OUTPUT_MODE_RECORDING);
 	obs_property_list_add_int(p, obs_module_text("StreamingOrRecording"), OUTPUT_MODE_STREAMING_OR_RECORDING);
 	obs_property_list_add_int(p, obs_module_text("VirtualCamera"), OUTPUT_MODE_VIRTUAL_CAMERA);
+	obs_property_list_add_int(p, obs_module_text("Websocket"), OUTPUT_MODE_WEBSOCKET);
 
 	obs_properties_add_path(record, "path", obs_module_text("Path"), OBS_PATH_DIRECTORY, NULL, NULL);
 	obs_properties_add_text(record, "filename_formatting", obs_module_text("FilenameFormatting"), OBS_TEXT_DEFAULT);
@@ -2033,11 +2057,22 @@ static bool start_record_source(obs_source_t *source, obs_data_t *request_data, 
 		}
 	}
 
-	if (strlen(filename))
-		obs_data_set_string(settings, "filename_formatting", filename);
+	const long long record_mode = obs_data_get_int(settings, "record_mode");
+	if (strlen(filename)) {
+		if (record_mode == OUTPUT_MODE_WEBSOCKET) {
+			websocket_context_set_next_filename(context->websocket_context, filename);
+		} else {
+			obs_data_set_string(settings, "filename_formatting", filename);
+		}
+	}
 	if (obs_data_has_user_value(request_data, "max_seconds"))
 		obs_data_set_int(settings, "record_max_seconds", obs_data_get_int(request_data, "max_seconds"));
-	obs_data_set_int(settings, "record_mode", OUTPUT_MODE_ALWAYS);
+	
+	if (record_mode == OUTPUT_MODE_WEBSOCKET) {
+		context->websocket_recording = true;
+	} else {
+		obs_data_set_int(settings, "record_mode", OUTPUT_MODE_ALWAYS);
+	}
 
 	obs_source_update(filter, settings);
 	obs_data_release(settings);
@@ -2123,8 +2158,18 @@ static bool stop_record_source(obs_source_t *source, obs_data_t *request_data, o
 	if (!filter)
 		return false;
 
+	struct source_record_filter_context *context = obs_obj_get_data(filter);
 	obs_data_t *settings = obs_data_create();
-	obs_data_set_int(settings, "record_mode", OUTPUT_MODE_NONE);
+	obs_data_t *current_settings = obs_source_get_settings(filter);
+	const long long record_mode = obs_data_get_int(current_settings, "record_mode");
+	obs_data_release(current_settings);
+
+	if (record_mode == OUTPUT_MODE_WEBSOCKET) {
+		context->websocket_recording = false;
+		obs_data_set_int(settings, "record_mode", OUTPUT_MODE_WEBSOCKET);
+	} else {
+		obs_data_set_int(settings, "record_mode", OUTPUT_MODE_NONE);
+	}
 	obs_source_update(filter, settings);
 	obs_data_release(settings);
 	obs_source_release(filter);

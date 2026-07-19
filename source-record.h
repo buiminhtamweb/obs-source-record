@@ -46,13 +46,15 @@ struct source_record_filter_context {
 	long long record_max_seconds;
 	int last_frontend_event;
 	void *websocket_context;
+	bool websocket_recording;
 };
 
 // WebSocket integration helper functions
 void *websocket_context_create(void);
 void websocket_context_destroy(void *ctx);
 void websocket_context_clear_next_filename(void *ctx);
-char *websocket_context_generate_path(void *ctx, const char *record_folder, const char *extension, const char *filename_formatting);
+void websocket_context_set_next_filename(void *ctx, const char *filename);
+char *websocket_context_generate_path(void *ctx, const char *record_folder, const char *extension, const char *filename_formatting, bool is_websocket_mode);
 struct source_record_filter_context *find_filter_context(const char *source_name);
 
 #ifdef __cplusplus
