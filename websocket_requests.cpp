@@ -16,6 +16,7 @@ struct websocket_context {
 	std::mutex mutex;
 	std::string nextFilename;
 	std::string activeFilename;
+	std::string initialBaseFilename;
 };
 
 static std::string get_base_filename(const std::string &path)
@@ -88,6 +89,9 @@ extern "C" char *websocket_context_generate_path(void *ctx, const char *record_f
 		}
 	}
 
+	std::string base = get_base_filename(final_filename);
+	wctx->initialBaseFilename = base;
+
 	std::error_code ec;
 	if (std::filesystem::exists(normalized_path, ec)) {
 		std::time_t t = std::time(nullptr);
@@ -100,7 +104,7 @@ extern "C" char *websocket_context_generate_path(void *ctx, const char *record_f
 		char time_buf[64];
 		std::strftime(time_buf, sizeof(time_buf), "%Y%m%d-%H%M%S", &tm_local);
 
-		std::string new_filename = get_base_filename(final_filename) + "-" + time_buf;
+		std::string new_filename = base + "-" + time_buf;
 		wctx->activeFilename = new_filename;
 		if (!ext.empty()) {
 			new_filename += "." + ext;
@@ -121,10 +125,97 @@ extern "C" char *websocket_context_generate_path(void *ctx, const char *record_f
 
 		blog(LOG_INFO, "[SourceRecord] Duplicate filename detected. Renamed to: %s", new_filename.c_str());
 	} else {
-		wctx->activeFilename = get_base_filename(final_filename);
+		wctx->activeFilename = base;
 	}
 
 	return bstrdup(normalized_path.c_str());
+}
+
+extern "C" char *websocket_context_generate_split_path(void *ctx, const char *record_folder, const char *extension)
+{
+	if (!ctx)
+		return nullptr;
+	auto *wctx = static_cast<websocket_context *>(ctx);
+	std::lock_guard<std::mutex> lock(wctx->mutex);
+
+	std::string base = wctx->initialBaseFilename;
+	if (base.empty()) {
+		std::string cur = wctx->activeFilename.empty() ? wctx->nextFilename : wctx->activeFilename;
+		base = get_base_filename(cur);
+		size_t pos = base.find_first_of("-");
+		if (pos != std::string::npos && pos > 0) {
+			if (base.length() > pos + 8 && std::isdigit(base[pos + 1])) {
+				base = base.substr(0, pos);
+			}
+		}
+	}
+	if (base.empty()) {
+		base = "001";
+	}
+
+	std::time_t t = std::time(nullptr);
+	std::tm tm_local;
+#ifdef _WIN32
+	localtime_s(&tm_local, &t);
+#else
+	localtime_r(&t, &tm_local);
+#endif
+	char time_buf[64];
+	std::strftime(time_buf, sizeof(time_buf), "%Y%m%d-%H%M%S", &tm_local);
+
+	std::string ext = extension ? extension : "";
+	std::string folder = record_folder ? record_folder : "";
+
+	std::string split_base = base + "-" + time_buf;
+	std::string candidate_filename = split_base;
+	if (!ext.empty()) {
+		candidate_filename += "." + ext;
+	}
+	std::string candidate_path = folder + "/" + candidate_filename;
+
+	std::string norm_path;
+	for (char c : candidate_path) {
+		if (c == '\\') {
+			norm_path += '/';
+		} else {
+			if (c == '/' && !norm_path.empty() && norm_path.back() == '/') {
+				continue;
+			}
+			norm_path += c;
+		}
+	}
+
+	std::error_code ec;
+	if (std::filesystem::exists(norm_path, ec)) {
+		for (int i = 1; i <= 100; i++) {
+			std::string try_base = split_base + "-" + std::to_string(i);
+			std::string try_filename = try_base;
+			if (!ext.empty()) {
+				try_filename += "." + ext;
+			}
+			std::string try_path = folder + "/" + try_filename;
+			std::string try_norm;
+			for (char c : try_path) {
+				if (c == '\\') {
+					try_norm += '/';
+				} else {
+					if (c == '/' && !try_norm.empty() && try_norm.back() == '/') {
+						continue;
+					}
+					try_norm += c;
+				}
+			}
+			if (!std::filesystem::exists(try_norm, ec)) {
+				norm_path = try_norm;
+				split_base = try_base;
+				break;
+			}
+		}
+	}
+
+	wctx->activeFilename = split_base;
+	blog(LOG_INFO, "[SourceRecord] Split path generated: %s (activeFilename=%s)", norm_path.c_str(), split_base.c_str());
+	return bstrdup(norm_path.c_str());
 }
 
 extern "C" void websocket_set_next_filename(obs_data_t *request_data, obs_data_t *response_data, void *param)

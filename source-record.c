@@ -1401,13 +1401,7 @@ static void source_record_split_hotkey(void *data, obs_hotkey_id id, obs_hotkey_
 	if (!pressed)
 		return;
 	struct source_record_filter_context *context = data;
-	if (!context->fileOutput)
-		return;
-	proc_handler_t *ph = obs_output_get_proc_handler(context->fileOutput);
-	struct calldata cd;
-	calldata_init(&cd);
-	proc_handler_call(ph, "split_file", &cd);
-	calldata_free(&cd);
+	split_record_source_context(context);
 }
 
 static void source_record_chapter_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -1727,14 +1721,7 @@ static bool source_record_split_button(obs_properties_t *props, obs_property_t *
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(property);
 	struct source_record_filter_context *context = data;
-	if (!context->fileOutput)
-		return false;
-	proc_handler_t *ph = obs_output_get_proc_handler(context->fileOutput);
-	struct calldata cd;
-	calldata_init(&cd);
-	proc_handler_call(ph, "split_file", &cd);
-	calldata_free(&cd);
-	return true;
+	return split_record_source_context(context);
 }
 
 bool output_exists(const char *id)
@@ -2216,6 +2203,35 @@ static bool unpause_record_source(obs_source_t *source, obs_data_t *request_data
 	return true;
 }
 
+static bool split_record_source_context(struct source_record_filter_context *context)
+{
+	if (!context || !context->fileOutput || !context->recording)
+		return false;
+
+	obs_data_t *settings = obs_source_get_settings(context->source);
+	const char *record_folder = obs_data_get_string(settings, "path");
+	const char *format = obs_data_get_string(settings, "rec_format");
+	const char *ext = GetFormatExt(format);
+
+	char *new_path = websocket_context_generate_split_path(context->websocket_context, record_folder, ext);
+	if (new_path) {
+		ensure_directory(new_path);
+		obs_data_t *output_settings = obs_data_create();
+		obs_data_set_string(output_settings, "path", new_path);
+		obs_output_update(context->fileOutput, output_settings);
+		obs_data_release(output_settings);
+		bfree(new_path);
+	}
+	obs_data_release(settings);
+
+	proc_handler_t *ph = obs_output_get_proc_handler(context->fileOutput);
+	struct calldata cd;
+	calldata_init(&cd);
+	bool success = proc_handler_call(ph, "split_file", &cd);
+	calldata_free(&cd);
+	return success;
+}
+
 static bool split_record_source(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data)
 {
 	obs_source_t *filter = get_source_record_filter(source, request_data, response_data, false);
@@ -2224,17 +2240,7 @@ static bool split_record_source(obs_source_t *source, obs_data_t *request_data, 
 
 	struct source_record_filter_context *context = obs_obj_get_data(filter);
 	obs_source_release(filter);
-	if (!context->fileOutput)
-		return false;
-	proc_handler_t *ph = obs_output_get_proc_handler(context->fileOutput);
-	struct calldata cd;
-	calldata_init(&cd);
-	if (!proc_handler_call(ph, "split_file", &cd)) {
-		calldata_free(&cd);
-		return false;
-	}
-	calldata_free(&cd);
-	return true;
+	return split_record_source_context(context);
 }
 
 static bool add_chapter_record_source(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data)
