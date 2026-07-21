@@ -29,6 +29,8 @@ DARRAY(obs_source_t *) source_record_filters;
 
 static void *vendor;
 
+static bool split_record_source_context(struct source_record_filter_context *context);
+
 static void run_queued(obs_task_t task, void *param)
 {
 	if (obs_in_task_thread(OBS_TASK_UI) && obs_get_video()) {
