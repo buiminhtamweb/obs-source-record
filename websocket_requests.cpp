@@ -9,6 +9,8 @@
 #include <ctime>
 #include <vector>
 #include <algorithm>
+#include <thread>
+#include <condition_variable>
 
 struct websocket_context {
 	std::mutex mutex;
@@ -64,7 +66,6 @@ extern "C" char *websocket_context_generate_path(void *ctx, const char *record_f
 			bfree(formatted);
 		}
 		final_path = std::string(record_folder) + "/" + final_filename;
-		wctx->activeFilename = get_base_filename(final_filename);
 	} else {
 		std::string combined_format = wctx->nextFilename + (filename_formatting ? filename_formatting : "");
 		char *formatted = os_generate_formatted_filename(extension, true, combined_format.c_str());
@@ -73,30 +74,6 @@ extern "C" char *websocket_context_generate_path(void *ctx, const char *record_f
 			bfree(formatted);
 		}
 		final_path = std::string(record_folder) + "/" + final_filename;
-
-		std::error_code ec;
-		if (std::filesystem::exists(final_path, ec)) {
-			std::time_t t = std::time(nullptr);
-			std::tm tm_local;
-#ifdef _WIN32
-			localtime_s(&tm_local, &t);
-#else
-			localtime_r(&t, &tm_local);
-#endif
-			char time_buf[64];
-			std::strftime(time_buf, sizeof(time_buf), "%Y%m%d-%H%M%S", &tm_local);
-
-			std::string new_filename = get_base_filename(final_filename) + "-" + time_buf;
-			wctx->activeFilename = new_filename;
-			if (!ext.empty()) {
-				new_filename += "." + ext;
-			}
-			final_path = std::string(record_folder) + "/" + new_filename;
-
-			blog(LOG_INFO, "Duplicate filename detected.\nRenamed to\n%s", new_filename.c_str());
-		} else {
-			wctx->activeFilename = get_base_filename(final_filename);
-		}
 	}
 
 	std::string normalized_path;
@@ -109,6 +86,42 @@ extern "C" char *websocket_context_generate_path(void *ctx, const char *record_f
 			}
 			normalized_path += c;
 		}
+	}
+
+	std::error_code ec;
+	if (std::filesystem::exists(normalized_path, ec)) {
+		std::time_t t = std::time(nullptr);
+		std::tm tm_local;
+#ifdef _WIN32
+		localtime_s(&tm_local, &t);
+#else
+		localtime_r(&t, &tm_local);
+#endif
+		char time_buf[64];
+		std::strftime(time_buf, sizeof(time_buf), "%Y%m%d-%H%M%S", &tm_local);
+
+		std::string new_filename = get_base_filename(final_filename) + "-" + time_buf;
+		wctx->activeFilename = new_filename;
+		if (!ext.empty()) {
+			new_filename += "." + ext;
+		}
+		std::string new_final_path = std::string(record_folder) + "/" + new_filename;
+
+		normalized_path.clear();
+		for (char c : new_final_path) {
+			if (c == '\\') {
+				normalized_path += '/';
+			} else {
+				if (c == '/' && !normalized_path.empty() && normalized_path.back() == '/') {
+					continue;
+				}
+				normalized_path += c;
+			}
+		}
+
+		blog(LOG_INFO, "[SourceRecord] Duplicate filename detected. Renamed to: %s", new_filename.c_str());
+	} else {
+		wctx->activeFilename = get_base_filename(final_filename);
 	}
 
 	return bstrdup(normalized_path.c_str());
@@ -336,9 +349,189 @@ extern "C" void websocket_get_active_sources_status(obs_data_t *request_data, ob
 	obs_data_set_bool(response_data, "success", true);
 }
 
+struct start_active_data {
+	std::vector<obs_source_t *> filters;
+};
+
+static void enum_active_filters(obs_source_t *parent, obs_source_t *child, void *param)
+{
+	if (strcmp(obs_source_get_unversioned_id(child), "source_record_filter") != 0)
+		return;
+
+	auto *data = static_cast<start_active_data *>(param);
+
+	if (std::find(data->filters.begin(), data->filters.end(), child) != data->filters.end())
+		return;
+	data->filters.push_back(child);
+
+	if (parent && obs_source_active(parent)) {
+		if (!obs_source_enabled(child)) {
+			obs_source_set_enabled(child, true);
+		}
+
+		struct source_record_filter_context *context = static_cast<struct source_record_filter_context *>(obs_obj_get_data(child));
+		if (context) {
+			obs_data_t *settings = obs_source_get_settings(child);
+			const long long record_mode = obs_data_get_int(settings, "record_mode");
+			if (record_mode == 6) { // OUTPUT_MODE_WEBSOCKET = 6
+				context->websocket_recording = true;
+			} else {
+				obs_data_set_int(settings, "record_mode", 1); // OUTPUT_MODE_ALWAYS = 1
+			}
+			obs_source_update(child, settings);
+			obs_data_release(settings);
+		}
+	}
+}
+
+static bool enum_source_for_active_filters(void *param, obs_source_t *source)
+{
+	obs_source_enum_filters(source, enum_active_filters, param);
+	return true;
+}
+
+extern "C" void websocket_start_active_recordings(obs_data_t *request_data, obs_data_t *response_data, void *param)
+{
+	(void)request_data;
+	(void)param;
+
+	start_active_data data;
+	obs_enum_sources(enum_source_for_active_filters, &data);
+	obs_enum_scenes(enum_source_for_active_filters, &data);
+
+	obs_data_set_bool(response_data, "success", true);
+}
+
+struct stop_all_data {
+	std::vector<obs_source_t *> filters;
+};
+
+static void enum_stop_filters(obs_source_t *parent, obs_source_t *child, void *param)
+{
+	if (strcmp(obs_source_get_unversioned_id(child), "source_record_filter") != 0)
+		return;
+
+	auto *data = static_cast<stop_all_data *>(param);
+
+	if (std::find(data->filters.begin(), data->filters.end(), child) != data->filters.end())
+		return;
+	data->filters.push_back(child);
+
+	struct source_record_filter_context *context = static_cast<struct source_record_filter_context *>(obs_obj_get_data(child));
+	if (context) {
+		obs_data_t *settings = obs_source_get_settings(child);
+		const long long record_mode = obs_data_get_int(settings, "record_mode");
+		if (record_mode == 6) { // OUTPUT_MODE_WEBSOCKET = 6
+			context->websocket_recording = false;
+		} else {
+			obs_data_set_int(settings, "record_mode", 0); // OUTPUT_MODE_NONE = 0
+		}
+		obs_source_update(child, settings);
+		obs_data_release(settings);
+	}
+}
+
+static bool enum_source_for_stop_filters(void *param, obs_source_t *source)
+{
+	obs_source_enum_filters(source, enum_stop_filters, param);
+	return true;
+}
+
+extern "C" void websocket_stop_all_recordings(obs_data_t *request_data, obs_data_t *response_data, void *param)
+{
+	(void)request_data;
+	(void)param;
+
+	stop_all_data data;
+	obs_enum_sources(enum_source_for_stop_filters, &data);
+	obs_enum_scenes(enum_source_for_stop_filters, &data);
+
+	obs_data_set_bool(response_data, "success", true);
+}
+
+static obs_websocket_vendor websocket_vendor_ptr = nullptr;
+
+struct obs_timer_t {
+	std::thread thread;
+	std::mutex mutex;
+	std::condition_variable cv;
+	bool active;
+
+	obs_timer_t() : active(true) {}
+};
+
+extern "C" obs_timer_t *obs_timer_create(void (*callback)(void *), void *param, uint32_t interval_ms)
+{
+	obs_timer_t *timer = new obs_timer_t();
+	timer->thread = std::thread([timer, callback, param, interval_ms]() {
+		std::unique_lock<std::mutex> lock(timer->mutex);
+		while (timer->active) {
+			if (timer->cv.wait_for(lock, std::chrono::milliseconds(interval_ms), [timer]() { return !timer->active; })) {
+				break;
+			}
+			lock.unlock();
+			callback(param);
+			lock.lock();
+		}
+	});
+	return timer;
+}
+
+extern "C" void obs_timer_destroy(obs_timer_t *timer)
+{
+	if (!timer)
+		return;
+	{
+		std::lock_guard<std::mutex> lock(timer->mutex);
+		timer->active = false;
+	}
+	timer->cv.notify_one();
+	if (timer->thread.joinable()) {
+		timer->thread.join();
+	}
+	delete timer;
+}
+
+static std::string get_filename_with_ext(const std::string &path)
+{
+	size_t last_slash = path.find_last_of("/\\");
+	return (last_slash == std::string::npos) ? path : path.substr(last_slash + 1);
+}
+
+extern "C" void websocket_emit_status_event(void *ctx, obs_source_t *parent, bool recording, uint64_t elapsed_ms, uint64_t elapsed_sec, const char *file_name)
+{
+	if (!websocket_vendor_ptr)
+		return;
+
+	auto *wctx = static_cast<websocket_context *>(ctx);
+	const char *source_name = parent ? obs_source_get_name(parent) : "";
+	const char *scene_name = parent ? get_scene_for_source(parent) : "";
+	std::string id_str = source_name;
+
+	obs_data_t *event_data = obs_data_create();
+	obs_data_set_string(event_data, "id", id_str.c_str());
+	obs_data_set_string(event_data, "scene", scene_name);
+	obs_data_set_string(event_data, "source", source_name);
+	obs_data_set_bool(event_data, "recording", recording);
+	obs_data_set_int(event_data, "elapsed_ms", elapsed_ms);
+	obs_data_set_int(event_data, "elapsed_sec", elapsed_sec);
+
+	std::string file_name_str;
+	if (recording && file_name) {
+		file_name_str = get_filename_with_ext(file_name);
+	}
+	obs_data_set_string(event_data, "file_name", file_name_str.c_str());
+
+	obs_websocket_vendor_emit_event(websocket_vendor_ptr, "SourceRecordStatus", event_data);
+	obs_data_release(event_data);
+}
+
 extern "C" void register_custom_websocket_requests(void *vendor)
 {
-	obs_websocket_vendor_register_request(static_cast<obs_websocket_vendor>(vendor), "SetNextFilename", websocket_set_next_filename, nullptr);
-	obs_websocket_vendor_register_request(static_cast<obs_websocket_vendor>(vendor), "GetRecordingStatus", websocket_get_recording_status, nullptr);
-	obs_websocket_vendor_register_request(static_cast<obs_websocket_vendor>(vendor), "GetActiveSourcesStatus", websocket_get_active_sources_status, nullptr);
+	websocket_vendor_ptr = static_cast<obs_websocket_vendor>(vendor);
+	obs_websocket_vendor_register_request(websocket_vendor_ptr, "SetNextFilename", websocket_set_next_filename, nullptr);
+	obs_websocket_vendor_register_request(websocket_vendor_ptr, "GetRecordingStatus", websocket_get_recording_status, nullptr);
+	obs_websocket_vendor_register_request(websocket_vendor_ptr, "GetActiveSourcesStatus", websocket_get_active_sources_status, nullptr);
+	obs_websocket_vendor_register_request(websocket_vendor_ptr, "StartActiveRecordings", websocket_start_active_recordings, nullptr);
+	obs_websocket_vendor_register_request(websocket_vendor_ptr, "StopAllRecordings", websocket_stop_all_recordings, nullptr);
 }

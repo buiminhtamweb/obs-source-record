@@ -235,6 +235,40 @@ static const char *GetFormatExt(const char *format)
 	return format;
 }
 
+static void source_record_status_timer_callback(void *param)
+{
+	struct source_record_filter_context *context = param;
+	if (!context || !context->recording)
+		return;
+
+	uint64_t now_ns = os_gettime_ns();
+	uint64_t elapsed_ns = now_ns - context->recording_start_ns;
+	uint64_t elapsed_sec = elapsed_ns / 1000000000;
+	uint64_t elapsed_ms = elapsed_ns / 1000000;
+
+	if (elapsed_sec == context->last_sent_second)
+		return;
+
+	context->last_sent_second = elapsed_sec;
+
+	obs_source_t *parent = obs_filter_get_parent(context->source);
+
+	const char *path = "";
+	obs_data_t *settings = NULL;
+	if (context->fileOutput) {
+		settings = obs_output_get_settings(context->fileOutput);
+		if (settings) {
+			path = obs_data_get_string(settings, "path");
+		}
+	}
+
+	websocket_emit_status_event(context->websocket_context, parent, true, elapsed_ms, elapsed_sec, path);
+
+	if (settings) {
+		obs_data_release(settings);
+	}
+}
+
 static void start_file_output_task(void *data)
 {
 	struct source_record_filter_context *context = data;
@@ -248,6 +282,14 @@ static void start_file_output_task(void *data)
 		blog(LOG_INFO, "Recording started\nOutput:\n%s", path);
 		obs_data_release(settings);
 		websocket_context_clear_next_filename(context->websocket_context);
+
+		context->recording = true;
+		context->recording_start_ns = os_gettime_ns();
+		context->last_sent_second = 0;
+		if (context->status_timer) {
+			obs_timer_destroy(context->status_timer);
+		}
+		context->status_timer = obs_timer_create(source_record_status_timer_callback, context, 1000);
 	}
 	context->starting_file_output = false;
 }
@@ -336,6 +378,15 @@ void release_output_stopped(void *data, calldata_t *cd)
 	struct stop_output *so = data;
 	if (so->is_recording) {
 		blog(LOG_INFO, "Recording stopped");
+		if (so->context->recording) {
+			so->context->recording = false;
+			if (so->context->status_timer) {
+				obs_timer_destroy(so->context->status_timer);
+				so->context->status_timer = NULL;
+			}
+			obs_source_t *parent = obs_filter_get_parent(so->context->source);
+			websocket_emit_status_event(so->context->websocket_context, parent, false, 0, 0, "");
+		}
 	}
 	if (!so->context->exiting)
 		run_queued((obs_task_t)obs_output_release, so->output);
@@ -1216,6 +1267,10 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 static void source_record_filter_destroy(void *data)
 {
 	struct source_record_filter_context *context = data;
+	if (context->status_timer) {
+		obs_timer_destroy(context->status_timer);
+		context->status_timer = NULL;
+	}
 	da_erase_item(source_record_filters, &context->source);
 	context->closing = true;
 	if (context->output_active) {
@@ -1385,6 +1440,26 @@ static void source_record_filter_tick(void *data, float seconds)
 	if (obs_obj_is_private(parent)) {
 		context->closing = true;
 		return;
+	}
+
+	bool is_recording = context->output_active && context->fileOutput && obs_output_active(context->fileOutput);
+	bool is_paused = is_recording && obs_output_paused(context->fileOutput);
+	bool is_streaming = context->output_active && context->streamOutput && obs_output_active(context->streamOutput);
+	bool is_replay_active = context->output_active && context->replayOutput && obs_output_active(context->replayOutput);
+
+	if (!context->status_initialized ||
+	    context->last_is_recording != is_recording ||
+	    context->last_is_paused != is_paused ||
+	    context->last_is_streaming != is_streaming ||
+	    context->last_is_replay_active != is_replay_active) {
+
+		context->last_is_recording = is_recording;
+		context->last_is_paused = is_paused;
+		context->last_is_streaming = is_streaming;
+		context->last_is_replay_active = is_replay_active;
+		context->status_initialized = true;
+
+		obs_source_update_properties(context->source);
 	}
 
 	if (context->enableHotkey == OBS_INVALID_HOTKEY_PAIR_ID)
@@ -1676,6 +1751,38 @@ bool output_exists(const char *id)
 static obs_properties_t *source_record_filter_properties(void *data)
 {
 	obs_properties_t *props = obs_properties_create();
+
+	if (data) {
+		struct source_record_filter_context *context = data;
+		bool is_recording = context->output_active && context->fileOutput && obs_output_active(context->fileOutput);
+		bool is_paused = is_recording && obs_output_paused(context->fileOutput);
+		bool is_streaming = context->output_active && context->streamOutput && obs_output_active(context->streamOutput);
+		bool is_replay_active = context->output_active && context->replayOutput && obs_output_active(context->replayOutput);
+
+		struct dstr status_msg;
+		dstr_init(&status_msg);
+
+		if (is_recording) {
+			if (is_paused) {
+				dstr_copy(&status_msg, obs_module_text("Status.RecordingPaused"));
+			} else {
+				dstr_copy(&status_msg, obs_module_text("Status.Recording"));
+			}
+		} else if (is_streaming) {
+			dstr_copy(&status_msg, obs_module_text("Status.Streaming"));
+		} else if (is_replay_active) {
+			dstr_copy(&status_msg, obs_module_text("Status.ReplayBufferActive"));
+		} else {
+			dstr_copy(&status_msg, obs_module_text("Status.Stopped"));
+		}
+
+		obs_property_t *p_status = obs_properties_add_text(props, "recording_status", obs_module_text("Status"), OBS_TEXT_INFO);
+		obs_data_t *settings = obs_source_get_settings(context->source);
+		obs_data_set_string(settings, "recording_status", status_msg.array);
+		obs_data_release(settings);
+
+		dstr_free(&status_msg);
+	}
 
 	obs_properties_t *record = obs_properties_create();
 

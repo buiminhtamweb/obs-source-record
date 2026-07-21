@@ -47,9 +47,25 @@ struct source_record_filter_context {
 	int last_frontend_event;
 	void *websocket_context;
 	bool websocket_recording;
+	bool last_is_recording;
+	bool last_is_paused;
+	bool last_is_streaming;
+	bool last_is_replay_active;
+	bool status_initialized;
+
+	bool recording;
+	uint64_t recording_start_ns;
+	uint64_t last_sent_second;
+	struct obs_timer_t *status_timer;
 };
 
 // WebSocket integration helper functions
+struct obs_timer_t;
+struct obs_timer_t *obs_timer_create(void (*callback)(void *), void *param, uint32_t interval_ms);
+void obs_timer_destroy(struct obs_timer_t *timer);
+
+void websocket_emit_status_event(void *ctx, obs_source_t *parent, bool recording, uint64_t elapsed_ms, uint64_t elapsed_sec, const char *file_name);
+
 void *websocket_context_create(void);
 void websocket_context_destroy(void *ctx);
 void websocket_context_clear_next_filename(void *ctx);
