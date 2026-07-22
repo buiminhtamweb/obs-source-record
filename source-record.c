@@ -564,7 +564,15 @@ static void start_file_output(struct source_record_filter_context *filter, obs_d
 	obs_data_set_string(s, "path", path);
 	bfree(path);
 	obs_data_set_string(s, "directory", obs_data_get_string(settings, "path"));
-	obs_data_set_string(s, "format", obs_data_get_string(settings, "filename_formatting"));
+	
+	const char *format_to_use = obs_data_get_string(settings, "filename_formatting");
+	if (is_websocket_mode) {
+		const char *active = websocket_context_get_active_filename(filter->websocket_context);
+		if (active && strlen(active)) {
+			format_to_use = active;
+		}
+	}
+	obs_data_set_string(s, "format", format_to_use);
 	obs_data_set_string(s, "extension", GetFormatExt(format));
 	obs_data_set_bool(s, "split_file", obs_data_get_bool(settings, "split_file"));
 	obs_data_set_int(s, "max_size_mb", obs_data_get_int(settings, "max_size_mb"));
@@ -2220,6 +2228,12 @@ static bool split_record_source_context(struct source_record_filter_context *con
 		ensure_directory(new_path);
 		obs_data_t *output_settings = obs_data_create();
 		obs_data_set_string(output_settings, "path", new_path);
+		
+		const char *active = websocket_context_get_active_filename(context->websocket_context);
+		if (active && strlen(active)) {
+			obs_data_set_string(output_settings, "format", active);
+		}
+		
 		obs_output_update(context->fileOutput, output_settings);
 		obs_data_release(output_settings);
 		bfree(new_path);

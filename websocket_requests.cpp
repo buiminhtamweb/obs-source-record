@@ -307,6 +307,15 @@ extern "C" void websocket_context_set_next_filename(void *ctx, const char *filen
 	wctx->nextFilename = filename ? filename : "";
 }
 
+extern "C" const char *websocket_context_get_active_filename(void *ctx)
+{
+	if (!ctx)
+		return nullptr;
+	auto *wctx = static_cast<websocket_context *>(ctx);
+	std::lock_guard<std::mutex> lock(wctx->mutex);
+	return wctx->activeFilename.c_str();
+}
+
 struct find_scene_data {
 	const char *source_name;
 	const char *scene_name;
