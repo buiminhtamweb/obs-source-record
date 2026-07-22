@@ -89,8 +89,13 @@ extern "C" char *websocket_context_generate_path(void *ctx, const char *record_f
 		}
 	}
 
-	std::string base = get_base_filename(final_filename);
-	wctx->initialBaseFilename = base;
+	if (is_websocket_mode && !wctx->nextFilename.empty()) {
+		wctx->initialBaseFilename = wctx->nextFilename;
+	} else {
+		wctx->initialBaseFilename = get_base_filename(final_filename);
+	}
+
+	std::string base = wctx->initialBaseFilename;
 
 	std::error_code ec;
 	if (std::filesystem::exists(normalized_path, ec)) {
@@ -161,12 +166,17 @@ extern "C" char *websocket_context_generate_split_path(void *ctx, const char *re
 	localtime_r(&t, &tm_local);
 #endif
 	char time_buf[64];
-	std::strftime(time_buf, sizeof(time_buf), "%Y%m%d-%H%M%S", &tm_local);
+	std::strftime(time_buf, sizeof(time_buf), "%H%M%S", &tm_local);
 
 	std::string ext = extension ? extension : "";
 	std::string folder = record_folder ? record_folder : "";
 
-	std::string split_base = base + "-" + time_buf;
+	std::string split_base;
+	if (!base.empty() && base.back() == '-') {
+		split_base = base + time_buf;
+	} else {
+		split_base = base + "-" + time_buf;
+	}
 	std::string candidate_filename = split_base;
 	if (!ext.empty()) {
 		candidate_filename += "." + ext;

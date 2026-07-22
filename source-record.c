@@ -574,7 +574,7 @@ static void start_file_output(struct source_record_filter_context *filter, obs_d
 	}
 	obs_data_set_string(s, "format", format_to_use);
 	obs_data_set_string(s, "extension", GetFormatExt(format));
-	obs_data_set_bool(s, "split_file", obs_data_get_bool(settings, "split_file"));
+	obs_data_set_bool(s, "split_file", true);
 	obs_data_set_int(s, "max_size_mb", obs_data_get_int(settings, "max_size_mb"));
 	obs_data_set_int(s, "max_time_sec", obs_data_get_int(settings, "max_time_sec"));
 
