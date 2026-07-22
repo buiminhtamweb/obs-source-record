@@ -68,7 +68,13 @@ extern "C" char *websocket_context_generate_path(void *ctx, const char *record_f
 		}
 		final_path = std::string(record_folder) + "/" + final_filename;
 	} else {
-		std::string combined_format = wctx->nextFilename + (filename_formatting ? filename_formatting : "");
+		std::string format_suffix = "%CCYY%MM%DD-%hh%mm%ss";
+		std::string combined_format;
+		if (!wctx->nextFilename.empty() && wctx->nextFilename.back() == '-') {
+			combined_format = wctx->nextFilename + format_suffix;
+		} else {
+			combined_format = wctx->nextFilename + "-" + format_suffix;
+		}
 		char *formatted = os_generate_formatted_filename(extension, true, combined_format.c_str());
 		if (formatted) {
 			final_filename = formatted;
@@ -109,7 +115,12 @@ extern "C" char *websocket_context_generate_path(void *ctx, const char *record_f
 		char time_buf[64];
 		std::strftime(time_buf, sizeof(time_buf), "%Y%m%d-%H%M%S", &tm_local);
 
-		std::string new_filename = base + "-" + time_buf;
+		std::string new_filename;
+		if (!base.empty() && base.back() == '-') {
+			new_filename = base + time_buf;
+		} else {
+			new_filename = base + "-" + time_buf;
+		}
 		wctx->activeFilename = new_filename;
 		if (!ext.empty()) {
 			new_filename += "." + ext;
@@ -166,7 +177,7 @@ extern "C" char *websocket_context_generate_split_path(void *ctx, const char *re
 	localtime_r(&t, &tm_local);
 #endif
 	char time_buf[64];
-	std::strftime(time_buf, sizeof(time_buf), "%H%M%S", &tm_local);
+	std::strftime(time_buf, sizeof(time_buf), "%Y%m%d-%H%M%S", &tm_local);
 
 	std::string ext = extension ? extension : "";
 	std::string folder = record_folder ? record_folder : "";
