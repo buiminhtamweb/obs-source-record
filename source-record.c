@@ -272,6 +272,8 @@ static void source_record_status_timer_callback(void *param)
 	}
 }
 
+static void file_changed_callback(void *data, calldata_t *cd);
+
 static void start_file_output_task(void *data)
 {
 	struct source_record_filter_context *context = data;
@@ -279,6 +281,10 @@ static void start_file_output_task(void *data)
 		if (!context->output_active) {
 			context->output_active = true;
 			obs_source_inc_showing(obs_filter_get_parent(context->source));
+		}
+		signal_handler_t *sh = obs_output_get_signal_handler(context->fileOutput);
+		if (sh) {
+			signal_handler_connect(sh, "file_changed", file_changed_callback, context);
 		}
 		obs_data_t *settings = obs_output_get_settings(context->fileOutput);
 		const char *path = obs_data_get_string(settings, "path");
@@ -396,12 +402,45 @@ static bool rename_file_with_retry(const char *src, const char *dst)
 	return false;
 }
 
+static void file_changed_callback(void *data, calldata_t *cd)
+{
+	struct source_record_filter_context *context = data;
+	const char *next_file = calldata_string(cd, "next_file");
+	if (!next_file || !strlen(next_file))
+		return;
+
+	blog(LOG_INFO, "[SourceRecord] file_changed signal received, next_file: %s", next_file);
+
+	if (context->current_tmp_path && context->current_target_path) {
+		rename_file_with_retry(context->current_tmp_path, context->current_target_path);
+		bfree(context->current_tmp_path);
+		bfree(context->current_target_path);
+		context->current_tmp_path = NULL;
+		context->current_target_path = NULL;
+	}
+
+	context->current_tmp_path = bstrdup(next_file);
+
+	size_t len = strlen(next_file);
+	if (len > 4 && strcmp(next_file + len - 4, ".tmp") == 0) {
+		char *target = bzalloc(len - 3);
+		memcpy(target, next_file, len - 4);
+		context->current_target_path = target;
+	} else {
+		context->current_target_path = bstrdup(next_file);
+	}
+}
+
 void release_output_stopped(void *data, calldata_t *cd)
 {
 	UNUSED_PARAMETER(cd);
 	struct stop_output *so = data;
 	if (so->is_recording) {
 		blog(LOG_INFO, "Recording stopped");
+		signal_handler_t *sh = obs_output_get_signal_handler(so->output);
+		if (sh) {
+			signal_handler_disconnect(sh, "file_changed", file_changed_callback, so->context);
+		}
 		if (so->context->recording) {
 			so->context->recording = false;
 			if (so->context->status_timer) {
@@ -2272,18 +2311,14 @@ static bool split_record_source_context(struct source_record_filter_context *con
 		ensure_directory(new_path);
 		obs_data_t *output_settings = obs_data_create();
 
-		// Save old paths to rename after split
-		char *old_tmp = context->current_tmp_path;
-		char *old_target = context->current_target_path;
-
-		// Set new paths
 		char *new_tmp = bzalloc(strlen(new_path) + 5);
 		sprintf(new_tmp, "%s.tmp", new_path);
 
-		context->current_tmp_path = new_tmp;
-		context->current_target_path = bstrdup(new_path);
+		char ext_tmp[32];
+		sprintf(ext_tmp, "%s.tmp", ext);
 
 		obs_data_set_string(output_settings, "path", new_tmp);
+		obs_data_set_string(output_settings, "extension", ext_tmp);
 		
 		const char *active = websocket_context_get_active_filename(context->websocket_context);
 		if (active && strlen(active)) {
@@ -2293,19 +2328,13 @@ static bool split_record_source_context(struct source_record_filter_context *con
 		obs_output_update(context->fileOutput, output_settings);
 		obs_data_release(output_settings);
 		bfree(new_path);
+		bfree(new_tmp);
 
 		proc_handler_t *ph = obs_output_get_proc_handler(context->fileOutput);
 		struct calldata cd;
 		calldata_init(&cd);
 		success = proc_handler_call(ph, "split_file", &cd);
 		calldata_free(&cd);
-
-		// Now rename the old tmp file to the target format
-		if (old_tmp && old_target) {
-			rename_file_with_retry(old_tmp, old_target);
-			bfree(old_tmp);
-			bfree(old_target);
-		}
 	}
 	obs_data_release(settings);
 	return success;
