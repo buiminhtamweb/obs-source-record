@@ -57,6 +57,9 @@ struct source_record_filter_context {
 	uint64_t recording_start_ns;
 	uint64_t last_sent_second;
 	struct obs_timer_t *status_timer;
+
+	char *current_tmp_path;
+	char *current_target_path;
 };
 
 // WebSocket integration helper functions

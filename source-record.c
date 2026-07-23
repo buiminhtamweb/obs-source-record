@@ -264,7 +264,8 @@ static void source_record_status_timer_callback(void *param)
 		}
 	}
 
-	websocket_emit_status_event(context->websocket_context, parent, true, elapsed_ms, elapsed_sec, path);
+	const char *emit_path = context->current_target_path ? context->current_target_path : path;
+	websocket_emit_status_event(context->websocket_context, parent, true, elapsed_ms, elapsed_sec, emit_path);
 
 	if (settings) {
 		obs_data_release(settings);
@@ -374,6 +375,27 @@ static void source_record_replay_saved(void *data, calldata_t *cd)
 	bfree(path_fallback);
 }
 
+#ifdef _WIN32
+#include <windows.h>
+#define sleep_ms(ms) Sleep(ms)
+#else
+#include <unistd.h>
+#define sleep_ms(ms) usleep((ms) * 1000)
+#endif
+
+static bool rename_file_with_retry(const char *src, const char *dst)
+{
+	for (int i = 0; i < 40; i++) { // try for up to 2 seconds
+		if (rename(src, dst) == 0) {
+			blog(LOG_INFO, "[SourceRecord] Successfully renamed %s to %s", src, dst);
+			return true;
+		}
+		sleep_ms(50);
+	}
+	blog(LOG_ERROR, "[SourceRecord] Failed to rename %s to %s after retries", src, dst);
+	return false;
+}
+
 void release_output_stopped(void *data, calldata_t *cd)
 {
 	UNUSED_PARAMETER(cd);
@@ -389,6 +411,14 @@ void release_output_stopped(void *data, calldata_t *cd)
 			obs_source_t *parent = obs_filter_get_parent(so->context->source);
 			websocket_emit_status_event(so->context->websocket_context, parent, false, 0, 0, "");
 		}
+		if (so->context->current_tmp_path && so->context->current_target_path) {
+			rename_file_with_retry(so->context->current_tmp_path, so->context->current_target_path);
+			bfree(so->context->current_tmp_path);
+			bfree(so->context->current_target_path);
+			so->context->current_tmp_path = NULL;
+			so->context->current_target_path = NULL;
+		}
+		blog(LOG_INFO, "Recording Finished");
 	}
 	if (!so->context->exiting)
 		run_queued((obs_task_t)obs_output_release, so->output);
@@ -561,7 +591,18 @@ static void start_file_output(struct source_record_filter_context *filter, obs_d
 	bool is_websocket_mode = (record_mode == OUTPUT_MODE_WEBSOCKET);
 	char *path = websocket_context_generate_path(filter->websocket_context, record_folder, ext, filename_formatting, is_websocket_mode);
 	ensure_directory(path);
-	obs_data_set_string(s, "path", path);
+
+	// Free any existing stale paths just in case
+	bfree(filter->current_target_path);
+	bfree(filter->current_tmp_path);
+
+	// Save target path and generate temporary path
+	filter->current_target_path = bstrdup(path);
+	char *tmp_path = bzalloc(strlen(path) + 5);
+	sprintf(tmp_path, "%s.tmp", path);
+	filter->current_tmp_path = tmp_path;
+
+	obs_data_set_string(s, "path", tmp_path);
 	bfree(path);
 	obs_data_set_string(s, "directory", obs_data_get_string(settings, "path"));
 	
@@ -1343,6 +1384,8 @@ static void source_record_filter_destroy(void *data)
 	}
 
 	context->source = NULL;
+	bfree(context->current_tmp_path);
+	bfree(context->current_target_path);
 	websocket_context_destroy(context->websocket_context);
 	bfree(context);
 }
@@ -2223,11 +2266,24 @@ static bool split_record_source_context(struct source_record_filter_context *con
 	const char *format = obs_data_get_string(settings, "rec_format");
 	const char *ext = GetFormatExt(format);
 
+	bool success = false;
 	char *new_path = websocket_context_generate_split_path(context->websocket_context, record_folder, ext);
 	if (new_path) {
 		ensure_directory(new_path);
 		obs_data_t *output_settings = obs_data_create();
-		obs_data_set_string(output_settings, "path", new_path);
+
+		// Save old paths to rename after split
+		char *old_tmp = context->current_tmp_path;
+		char *old_target = context->current_target_path;
+
+		// Set new paths
+		char *new_tmp = bzalloc(strlen(new_path) + 5);
+		sprintf(new_tmp, "%s.tmp", new_path);
+
+		context->current_tmp_path = new_tmp;
+		context->current_target_path = bstrdup(new_path);
+
+		obs_data_set_string(output_settings, "path", new_tmp);
 		
 		const char *active = websocket_context_get_active_filename(context->websocket_context);
 		if (active && strlen(active)) {
@@ -2237,14 +2293,21 @@ static bool split_record_source_context(struct source_record_filter_context *con
 		obs_output_update(context->fileOutput, output_settings);
 		obs_data_release(output_settings);
 		bfree(new_path);
+
+		proc_handler_t *ph = obs_output_get_proc_handler(context->fileOutput);
+		struct calldata cd;
+		calldata_init(&cd);
+		success = proc_handler_call(ph, "split_file", &cd);
+		calldata_free(&cd);
+
+		// Now rename the old tmp file to the target format
+		if (old_tmp && old_target) {
+			rename_file_with_retry(old_tmp, old_target);
+			bfree(old_tmp);
+			bfree(old_target);
+		}
 	}
 	obs_data_release(settings);
-
-	proc_handler_t *ph = obs_output_get_proc_handler(context->fileOutput);
-	struct calldata cd;
-	calldata_init(&cd);
-	bool success = proc_handler_call(ph, "split_file", &cd);
-	calldata_free(&cd);
 	return success;
 }
 
